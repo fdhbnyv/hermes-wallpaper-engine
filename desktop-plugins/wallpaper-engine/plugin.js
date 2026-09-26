@@ -271,7 +271,8 @@ export default {
     }
 
     // Live-through mode: paint nothing so the desktop's real WE scene shows
-    // through the transparent window (same effect as Clear translucency).
+    // through a CLEAR (truly transparent) window. In glass mode the window is
+    // opaque and this state must NOT be used — applyMode decides instead.
     let liveThrough = false
     function setLiveThrough(on) {
       if (liveThrough === on) return
@@ -279,14 +280,12 @@ export default {
       if (on) {
         resetLayer()
         document.documentElement.setAttribute('data-we-live', '')
-        enableClear()
         host.notify({
           kind: 'info',
-          message: 'WE 场景无法在窗口内渲染，已自动开启 Clear 透明模式 — 桌面上的实时场景正透过窗口显示'
+          message: 'WE 场景无法在窗口内渲染，已切换到透出模式（Clear 透明窗口下，桌面实时场景直接可见）'
         })
       } else {
         document.documentElement.removeAttribute('data-we-live')
-        restoreTranslucency()
       }
     }
 
@@ -344,38 +343,92 @@ export default {
       return []
     }
 
-    // Only rebuild when the wallpaper identity changes; when nothing could be
-    // mounted the guard resets so the next poll retries the real wallpaper.
+    // ---- unified paint decision ------------------------------------------
+    // What to render depends BOTH on the wallpaper AND on Hermes' current
+    // window state: Clear (truly transparent) can show the desktop through;
+    // Glass keeps the window opaque, so transparency is useless there and we
+    // must paint real content instead of leaving the window blank.
+    let lastWp = null
     let lastKey = ''
+
+    function windowIsClear() {
+      return document.documentElement.hasAttribute('data-hermes-clear')
+    }
+
+    function renderSceneFallback(clear) {
+      if (clear) {
+        // Truly transparent window: the desktop's WE scene shows through.
+        setLiveThrough(true)
+        return
+      }
+      const mode = (readBook() || {}).mode
+      if (mode === 'glass') {
+        // User picked Glass: the window is opaque, so transparency cannot
+        // show the desktop through — paint the built-in wallpaper instead
+        // of leaving nothing (and do NOT fight the user's choice).
+        setLiveThrough(false)
+        resetLayer()
+        showImage(DEFAULT_WALLPAPER)
+      } else if (autoClearOn) {
+        // Opaque + auto-clear enabled: open Clear so the scene shows through.
+        setLiveThrough(true)
+        enableClear()
+      } else {
+        // Auto-clear disabled and window not transparent: built-in wallpaper.
+        setLiveThrough(false)
+        resetLayer()
+        showImage(DEFAULT_WALLPAPER)
+      }
+    }
+
+    async function applyMode() {
+      const wp = lastWp
+      if (!wp) return
+      const hasMedia = !!(wp.media && wp.type)
+      const clear = windowIsClear()
+
+      if (hasMedia) {
+        const key = (wp.id || '') + '|' + (wp.media || '') + '|' + (wp.preview || '') + '|' + (wp.type || '')
+        if (key !== lastKey) {
+          lastKey = key
+          const mounted = await renderCandidates(candidatesFor(wp))
+          if (mounted) {
+            setLiveThrough(false)
+            // If we auto-opened Clear for a previous scene wallpaper, restore
+            // the user's original window so the video plays in-window.
+            restoreTranslucency()
+          } else {
+            // Real media failed — degrade like a scene wallpaper.
+            lastKey = ''
+            renderSceneFallback(clear)
+          }
+        } else {
+          setLiveThrough(false)
+        }
+        return
+      }
+
+      // Scene wallpaper: no real media to play.
+      lastKey = ''
+      renderSceneFallback(clear)
+    }
 
     async function refreshBg() {
       try {
         const r = await ctx.rest('/we-status', { method: 'GET' })
         const wp = r && r.wallpaper
         if (wp && (wp.media || wp.preview)) {
-          const key = (wp.id || '') + '|' + (wp.media || '') + '|' + (wp.preview || '') + '|' + (wp.type || '')
-          if (key !== lastKey) {
-            lastKey = key
-            const mounted = await renderCandidates(candidatesFor(wp))
-            if (mounted) {
-              setLiveThrough(false)
-            } else {
-              // Real media missing or failed — show the desktop through
-              // instead of an ugly static preview.
-              setLiveThrough(true)
-              lastKey = '' // retry the real wallpaper on the next poll
-            }
-          }
+          lastWp = wp
           document.documentElement.setAttribute('data-we-title', wp.title || '')
+          await applyMode()
         } else {
           // Backend up but no wallpaper configured — show the built-in
           // default so the window is never black.
-          if (lastKey !== '') {
-            lastKey = ''
-            setLiveThrough(false)
-            resetLayer()
-            showImage(DEFAULT_WALLPAPER)
-          }
+          lastWp = null
+          lastKey = ''
+          setLiveThrough(false)
+          resetLayer()
+          showImage(DEFAULT_WALLPAPER)
           document.documentElement.removeAttribute('data-we-title')
         }
       } catch (e) {
@@ -389,6 +442,17 @@ export default {
     showImage(DEFAULT_WALLPAPER)
     refreshBg()
     const timer = setInterval(refreshBg, 15000)
+
+    // React when Hermes switches Clear <-> Glass: re-decide what to paint.
+    let applyTimer = null
+    const clearObserver = new MutationObserver(() => {
+      clearTimeout(applyTimer)
+      applyTimer = setTimeout(() => applyMode(), 250)
+    })
+    clearObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-hermes-clear']
+    })
 
     // 2. Status bar chip
     ctx.register({
@@ -455,6 +519,8 @@ export default {
     // Cleanup when the plugin unloads/disables
     ctx.onDispose(() => {
       clearInterval(timer)
+      clearTimeout(applyTimer)
+      clearObserver.disconnect()
       style.remove()
       mediaHost.remove()
       restoreTranslucency()
